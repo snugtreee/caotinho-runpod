@@ -4,11 +4,9 @@ import os
 import requests
 import tempfile
 import uuid
-import base64
 import boto3
 from pathlib import Path
 
-# ── Config ─────────────────────────────────────────────────────────────────────
 R2_ENDPOINT   = os.environ.get("R2_ENDPOINT", "")
 R2_ACCESS_KEY = os.environ.get("R2_ACCESS_KEY", "")
 R2_SECRET_KEY = os.environ.get("R2_SECRET_KEY", "")
@@ -16,161 +14,127 @@ R2_BUCKET     = os.environ.get("R2_BUCKET", "caotinho")
 R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "")
 
 
-def get_s3_client():
+def get_s3():
     return boto3.client(
         "s3",
         endpoint_url=R2_ENDPOINT,
         aws_access_key_id=R2_ACCESS_KEY,
         aws_secret_access_key=R2_SECRET_KEY,
+        region_name="auto",
     )
 
 
-def download_file(url: str, dest_path: str) -> str:
-    """Download a remote URL to dest_path. Returns dest_path."""
-    resp = requests.get(url, stream=True, timeout=120)
-    resp.raise_for_status()
-    with open(dest_path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=8192):
+def download_file(url: str, dest: str) -> str:
+    r = requests.get(url, stream=True, timeout=120)
+    r.raise_for_status()
+    with open(dest, "wb") as f:
+        for chunk in r.iter_content(8192):
             f.write(chunk)
-    return dest_path
+    return dest
 
 
-def upload_to_r2(local_path: str, key: str, content_type: str = "video/mp4") -> str:
-    """Upload file to Cloudflare R2 and return public URL."""
-    s3 = get_s3_client()
-    s3.upload_file(local_path, R2_BUCKET, key, ExtraArgs={"ContentType": content_type})
+def upload_to_r2(local_path: str, key: str, content_type="video/mp4") -> str:
+    get_s3().upload_file(local_path, R2_BUCKET, key, ExtraArgs={"ContentType": content_type})
     return f"{R2_PUBLIC_URL}/{key}"
 
 
-def upload_audio_from_base64(b64_data: str, key: str, content_type: str = "audio/mpeg") -> str:
-    """Decode base64 audio and upload directly to R2."""
-    audio_bytes = base64.b64decode(b64_data)
-    s3 = get_s3_client()
-    s3.put_object(
-        Bucket=R2_BUCKET,
-        Key=key,
-        Body=audio_bytes,
-        ContentType=content_type,
+def presign_upload(key: str, content_type: str, expires: int = 3600) -> dict:
+    """Generate a presigned PUT URL so the browser can upload directly to R2."""
+    url = get_s3().generate_presigned_url(
+        "put_object",
+        Params={"Bucket": R2_BUCKET, "Key": key, "ContentType": content_type},
+        ExpiresIn=expires,
+        HttpMethod="PUT",
     )
-    return f"{R2_PUBLIC_URL}/{key}"
+    return {
+        "upload_url": url,
+        "public_url": f"{R2_PUBLIC_URL}/{key}",
+    }
 
 
-def concatenate_videos(video_paths: list, output_path: str) -> str:
-    list_file = output_path + ".txt"
+def concatenate_videos(paths: list, output: str) -> str:
+    list_file = output + ".txt"
     with open(list_file, "w") as f:
-        for p in video_paths:
+        for p in paths:
             f.write(f"file '{p}'\n")
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", list_file,
-        "-c", "copy",
-        output_path,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file, "-c", "copy", output],
+        capture_output=True, text=True
+    )
     os.remove(list_file)
+    if r.returncode != 0:
+        raise RuntimeError(f"FFmpeg concat failed:\n{r.stderr}")
+    return output
 
-    if result.returncode != 0:
-        raise RuntimeError(f"FFmpeg concat failed:\n{result.stderr}")
-    return output_path
 
-
-def add_music(video_path: str, music_path: str, output_path: str) -> str:
-    cmd = [
+def add_music(video: str, music: str, output: str) -> str:
+    r = subprocess.run([
         "ffmpeg", "-y",
-        "-i", video_path,
+        "-i", video,
         "-stream_loop", "-1",
-        "-i", music_path,
+        "-i", music,
         "-map", "0:v:0",
         "-map", "1:a:0",
         "-shortest",
         "-c:v", "copy",
         "-c:a", "aac",
         "-b:a", "192k",
-        output_path,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"FFmpeg add_music failed:\n{result.stderr}")
-    return output_path
+        output,
+    ], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"FFmpeg add_music failed:\n{r.stderr}")
+    return output
 
 
 def handler(job: dict) -> dict:
-    """
-    RunPod Serverless entrypoint.
+    inp = job.get("input", {})
+    action = inp.get("action", "")
 
-    Supports two actions:
+    # ── presign: gera URL para o browser fazer upload direto ──
+    if action == "presign":
+        key          = inp.get("key", f"caotinho/music/{uuid.uuid4()}.mp3")
+        content_type = inp.get("content_type", "audio/mpeg")
+        print(f"[handler] Generating presigned URL for {key}")
+        return presign_upload(key, content_type)
 
-    1. upload_audio — upload base64 audio to R2, returns public URL
-       Input: { action: "upload_audio", key: "...", data: "<base64>", content_type: "audio/mpeg" }
-       Output: { url: "https://..." }
-
-    2. (default) — concatenate videos + add music
-       Input: { video_urls: [...], music_url: "https://...", output_key: "..." }
-       Output: { output_url: "https://..." }
-    """
-    job_input = job.get("input", {})
-    action = job_input.get("action", "")
-
-    # ── Action: upload_audio ──────────────────────────────────────────────────
-    if action == "upload_audio":
-        key          = job_input.get("key", f"caotinho/music/{uuid.uuid4()}.mp3")
-        b64_data     = job_input.get("data", "")
-        content_type = job_input.get("content_type", "audio/mpeg")
-
-        if not b64_data:
-            return {"error": "data (base64) is required for upload_audio"}
-
-        print(f"[handler] Uploading audio to R2 as {key}...")
-        public_url = upload_audio_from_base64(b64_data, key, content_type)
-        print(f"[handler] Audio uploaded → {public_url}")
-        return {"url": public_url}
-
-    # ── Action: default (concatenate + mix) ──────────────────────────────────
-    video_urls: list  = job_input.get("video_urls", [])
-    music_url:  str   = job_input.get("music_url", "")
-    output_key: str   = job_input.get("output_key", f"caotinho/{uuid.uuid4()}.mp4")
+    # ── concat + mix (fluxo principal) ──
+    video_urls = inp.get("video_urls", [])
+    music_url  = inp.get("music_url", "")
+    output_key = inp.get("output_key", f"caotinho/{uuid.uuid4()}.mp4")
 
     if not video_urls:
-        return {"error": "video_urls is required and must not be empty"}
+        return {"error": "video_urls is required"}
     if not music_url:
         return {"error": "music_url is required"}
     if not music_url.startswith("http"):
-        return {"error": f"music_url must be a valid URL, got: {music_url[:100]}"}
+        return {"error": f"music_url must be a valid URL, got: {music_url[:80]}"}
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp = Path(tmpdir)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
 
-        # 1. Download video clips
         video_paths = []
-        for idx, url in enumerate(video_urls):
-            ext = Path(url.split("?")[0]).suffix or ".mp4"
-            dest = str(tmp / f"clip_{idx:03d}{ext}")
-            print(f"[handler] Downloading clip {idx+1}/{len(video_urls)}: {url}")
+        for i, url in enumerate(video_urls):
+            ext  = Path(url.split("?")[0]).suffix or ".mp4"
+            dest = str(tmp / f"clip_{i:03d}{ext}")
+            print(f"[handler] Downloading clip {i+1}/{len(video_urls)}")
             download_file(url, dest)
             video_paths.append(dest)
 
-        # 2. Download music
         music_ext  = Path(music_url.split("?")[0]).suffix or ".mp3"
         music_path = str(tmp / f"music{music_ext}")
-        print(f"[handler] Downloading music: {music_url}")
+        print("[handler] Downloading music")
         download_file(music_url, music_path)
 
-        # 3. Concatenate clips
-        concat_path = str(tmp / "concat.mp4")
-        print(f"[handler] Concatenating {len(video_paths)} clips...")
-        concatenate_videos(video_paths, concat_path)
+        concat = str(tmp / "concat.mp4")
+        print("[handler] Concatenating clips")
+        concatenate_videos(video_paths, concat)
 
-        # 4. Mix in music
-        final_path = str(tmp / "final.mp4")
-        print("[handler] Adding music...")
-        add_music(concat_path, music_path, final_path)
+        final = str(tmp / "final.mp4")
+        print("[handler] Adding music")
+        add_music(concat, music_path, final)
 
-        # 5. Upload to R2
-        print(f"[handler] Uploading to R2 as {output_key}...")
-        public_url = upload_to_r2(final_path, output_key)
+        print(f"[handler] Uploading to R2: {output_key}")
+        public_url = upload_to_r2(final, output_key)
 
     print(f"[handler] Done → {public_url}")
     return {"output_url": public_url}
