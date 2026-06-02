@@ -4,19 +4,25 @@ import os
 import requests
 import tempfile
 import uuid
+import base64
 import boto3
 from pathlib import Path
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-# Set these as RunPod Secrets / env vars:
-#   R2_ENDPOINT, R2_ACCESS_KEY, R2_SECRET_KEY, R2_BUCKET, R2_PUBLIC_URL
-# Or replace with any S3-compatible storage (AWS S3, Backblaze B2, etc.)
-
-R2_ENDPOINT   = os.environ.get("R2_ENDPOINT", "")          # e.g. https://<accountid>.r2.cloudflarestorage.com
+R2_ENDPOINT   = os.environ.get("R2_ENDPOINT", "")
 R2_ACCESS_KEY = os.environ.get("R2_ACCESS_KEY", "")
 R2_SECRET_KEY = os.environ.get("R2_SECRET_KEY", "")
 R2_BUCKET     = os.environ.get("R2_BUCKET", "caotinho")
-R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "")        # e.g. https://pub-xxx.r2.dev
+R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "")
+
+
+def get_s3_client():
+    return boto3.client(
+        "s3",
+        endpoint_url=R2_ENDPOINT,
+        aws_access_key_id=R2_ACCESS_KEY,
+        aws_secret_access_key=R2_SECRET_KEY,
+    )
 
 
 def download_file(url: str, dest_path: str) -> str:
@@ -29,25 +35,27 @@ def download_file(url: str, dest_path: str) -> str:
     return dest_path
 
 
-def upload_to_r2(local_path: str, key: str) -> str:
+def upload_to_r2(local_path: str, key: str, content_type: str = "video/mp4") -> str:
     """Upload file to Cloudflare R2 and return public URL."""
-    s3 = boto3.client(
-        "s3",
-        endpoint_url=R2_ENDPOINT,
-        aws_access_key_id=R2_ACCESS_KEY,
-        aws_secret_access_key=R2_SECRET_KEY,
-    )
-    s3.upload_file(local_path, R2_BUCKET, key, ExtraArgs={"ContentType": "video/mp4"})
+    s3 = get_s3_client()
+    s3.upload_file(local_path, R2_BUCKET, key, ExtraArgs={"ContentType": content_type})
     return f"{R2_PUBLIC_URL}/{key}"
 
 
-def concatenate_videos(video_paths: list[str], output_path: str) -> str:
-    """
-    Concatenate video files using FFmpeg concat demuxer.
-    All input clips must have the same codec / resolution for lossless concat.
-    If not, use the filter_complex path (re-encode, slower).
-    """
-    # Write a concat list file
+def upload_audio_from_base64(b64_data: str, key: str, content_type: str = "audio/mpeg") -> str:
+    """Decode base64 audio and upload directly to R2."""
+    audio_bytes = base64.b64decode(b64_data)
+    s3 = get_s3_client()
+    s3.put_object(
+        Bucket=R2_BUCKET,
+        Key=key,
+        Body=audio_bytes,
+        ContentType=content_type,
+    )
+    return f"{R2_PUBLIC_URL}/{key}"
+
+
+def concatenate_videos(video_paths: list, output_path: str) -> str:
     list_file = output_path + ".txt"
     with open(list_file, "w") as f:
         for p in video_paths:
@@ -58,7 +66,7 @@ def concatenate_videos(video_paths: list[str], output_path: str) -> str:
         "-f", "concat",
         "-safe", "0",
         "-i", list_file,
-        "-c", "copy",        # lossless stream copy — fast
+        "-c", "copy",
         output_path,
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -70,21 +78,16 @@ def concatenate_videos(video_paths: list[str], output_path: str) -> str:
 
 
 def add_music(video_path: str, music_path: str, output_path: str) -> str:
-    """
-    Replace the audio track of video_path with music_path.
-    Music is looped / trimmed to match the video duration.
-    Original video audio is discarded.
-    """
     cmd = [
         "ffmpeg", "-y",
         "-i", video_path,
-        "-stream_loop", "-1",   # loop music if shorter than video
+        "-stream_loop", "-1",
         "-i", music_path,
-        "-map", "0:v:0",        # video stream from first input
-        "-map", "1:a:0",        # audio stream from second input
-        "-shortest",            # stop when the shorter stream ends (video)
-        "-c:v", "copy",         # copy video — no re-encode
-        "-c:a", "aac",          # encode audio to AAC
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-shortest",
+        "-c:v", "copy",
+        "-c:a", "aac",
         "-b:a", "192k",
         output_path,
     ]
@@ -98,34 +101,49 @@ def handler(job: dict) -> dict:
     """
     RunPod Serverless entrypoint.
 
-    Expected input:
-    {
-        "input": {
-            "video_urls": ["https://...", "https://...", ...],   // ordered list of video clips
-            "music_url":  "https://...",                         // background music
-            "output_key": "optional/custom/key.mp4"             // optional R2 object key
-        }
-    }
+    Supports two actions:
 
-    Returns:
-    {
-        "output_url": "https://pub-xxx.r2.dev/caotinho/uuid.mp4"
-    }
+    1. upload_audio — upload base64 audio to R2, returns public URL
+       Input: { action: "upload_audio", key: "...", data: "<base64>", content_type: "audio/mpeg" }
+       Output: { url: "https://..." }
+
+    2. (default) — concatenate videos + add music
+       Input: { video_urls: [...], music_url: "https://...", output_key: "..." }
+       Output: { output_url: "https://..." }
     """
     job_input = job.get("input", {})
-    video_urls: list[str] = job_input.get("video_urls", [])
-    music_url:  str       = job_input.get("music_url", "")
-    output_key: str       = job_input.get("output_key", f"caotinho/{uuid.uuid4()}.mp4")
+    action = job_input.get("action", "")
+
+    # ── Action: upload_audio ──────────────────────────────────────────────────
+    if action == "upload_audio":
+        key          = job_input.get("key", f"caotinho/music/{uuid.uuid4()}.mp3")
+        b64_data     = job_input.get("data", "")
+        content_type = job_input.get("content_type", "audio/mpeg")
+
+        if not b64_data:
+            return {"error": "data (base64) is required for upload_audio"}
+
+        print(f"[handler] Uploading audio to R2 as {key}...")
+        public_url = upload_audio_from_base64(b64_data, key, content_type)
+        print(f"[handler] Audio uploaded → {public_url}")
+        return {"url": public_url}
+
+    # ── Action: default (concatenate + mix) ──────────────────────────────────
+    video_urls: list  = job_input.get("video_urls", [])
+    music_url:  str   = job_input.get("music_url", "")
+    output_key: str   = job_input.get("output_key", f"caotinho/{uuid.uuid4()}.mp4")
 
     if not video_urls:
         return {"error": "video_urls is required and must not be empty"}
     if not music_url:
         return {"error": "music_url is required"}
+    if not music_url.startswith("http"):
+        return {"error": f"music_url must be a valid URL, got: {music_url[:100]}"}
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
 
-        # 1. Download all video clips
+        # 1. Download video clips
         video_paths = []
         for idx, url in enumerate(video_urls):
             ext = Path(url.split("?")[0]).suffix or ".mp4"
