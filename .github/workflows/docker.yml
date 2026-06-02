@@ -3,20 +3,11 @@ name: Build & Push to DockerHub
 on:
   push:
     branches: [main]
-    paths:
-      - 'handler.py'
-      - 'Dockerfile'
-      - 'requirements.txt'
-      - '.github/workflows/docker.yml'
-  workflow_dispatch:   # manual trigger
-
-env:
-  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/caotinho-ffmpeg
+  workflow_dispatch:
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,11 +26,6 @@ jobs:
         with:
           context: .
           push: true
-          tags: |
-            ${{ env.IMAGE_NAME }}:latest
-            ${{ env.IMAGE_NAME }}:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Image digest
-        run: echo "Pushed ${{ env.IMAGE_NAME }}:latest"
+          tags: luizvenceslau/caotinho-ffmpeg:latest
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
