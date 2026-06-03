@@ -4,6 +4,7 @@ import os
 import requests
 import tempfile
 import uuid
+import json
 import boto3
 from pathlib import Path
 
@@ -12,6 +13,9 @@ R2_ACCESS_KEY = os.environ.get("R2_ACCESS_KEY", "")
 R2_SECRET_KEY = os.environ.get("R2_SECRET_KEY", "")
 R2_BUCKET     = os.environ.get("R2_BUCKET", "caotinho")
 R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "")
+
+TARGET_W = 1280
+TARGET_H = 720
 
 
 def get_s3():
@@ -48,59 +52,62 @@ def presign_upload(key: str, content_type: str, expires: int = 3600) -> dict:
     return {"upload_url": url, "public_url": f"{R2_PUBLIC_URL}/{key}"}
 
 
-def get_video_duration(path: str) -> float:
-    """Get video duration in seconds using ffprobe."""
+def get_duration(path: str) -> float:
     r = subprocess.run([
-        "ffprobe", "-v", "quiet", "-print_format", "json",
-        "-show_format", path
+        "ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", path
     ], capture_output=True, text=True)
-    import json
     try:
         return float(json.loads(r.stdout)["format"]["duration"])
     except:
         return 5.0
 
 
+def normalize_to_landscape(input_path: str, output_path: str) -> str:
+    """Scale and pad any video to 1280x720 landscape."""
+    r = subprocess.run([
+        "ffmpeg", "-y", "-i", input_path,
+        "-vf", f"scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=decrease,"
+               f"pad={TARGET_W}:{TARGET_H}:(ow-iw)/2:(oh-ih)/2:color=black",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+        "-an", output_path
+    ], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"normalize failed:\n{r.stderr[-500:]}")
+    return output_path
+
+
 def concatenate_videos_loop(paths: list, output: str, target_duration: float) -> str:
-    """Concatenate clips in loop until target_duration is reached, then trim."""
-    # Calculate how many loops needed
-    clip_duration = sum(get_video_duration(p) for p in paths)
+    """Loop clips until target_duration, all normalized to 1280x720."""
+    clip_duration = sum(get_duration(p) for p in paths)
     if clip_duration <= 0:
         clip_duration = len(paths) * 5.0
-    
-    loops_needed = int(target_duration / clip_duration) + 2
-    print(f"[handler] Clips duration: {clip_duration:.1f}s, target: {target_duration:.1f}s, loops: {loops_needed}")
 
-    # Write concat list with loops
+    loops_needed = int(target_duration / clip_duration) + 2
+    print(f"[handler] clip_dur={clip_duration:.1f}s target={target_duration:.1f}s loops={loops_needed}")
+
     list_file = output + ".txt"
     with open(list_file, "w") as f:
         for _ in range(loops_needed):
             for p in paths:
                 f.write(f"file '{p}'\n")
 
-    # Concat then trim to target duration
     looped = output + "_looped.mp4"
     r = subprocess.run([
         "ffmpeg", "-y", "-f", "concat", "-safe", "0",
         "-i", list_file, "-c", "copy", looped
     ], capture_output=True, text=True)
     os.remove(list_file)
-
     if r.returncode != 0:
-        raise RuntimeError(f"FFmpeg loop concat failed:\n{r.stderr}")
+        raise RuntimeError(f"loop concat failed:\n{r.stderr[-500:]}")
 
-    # Scale to 1280x720 landscape and trim
+    # Trim to target duration
     r2 = subprocess.run([
-        "ffmpeg", "-y", "-i", looped,
-        "-t", str(target_duration),
-        "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-an", output
+        "ffmpeg", "-y", "-i", looped, "-t", str(target_duration),
+        "-c", "copy", "-an", output
     ], capture_output=True, text=True)
     os.remove(looped)
-
     if r2.returncode != 0:
-        raise RuntimeError(f"FFmpeg scale/trim failed:\n{r2.stderr}")
+        raise RuntimeError(f"trim failed:\n{r2.stderr[-500:]}")
     return output
 
 
@@ -115,7 +122,7 @@ def concatenate_videos(paths: list, output: str) -> str:
     ], capture_output=True, text=True)
     os.remove(list_file)
     if r.returncode != 0:
-        raise RuntimeError(f"FFmpeg concat failed:\n{r.stderr}")
+        raise RuntimeError(f"concat failed:\n{r.stderr[-500:]}")
     return output
 
 
@@ -123,18 +130,14 @@ def add_music(video: str, music: str, output: str) -> str:
     r = subprocess.run([
         "ffmpeg", "-y",
         "-i", video,
-        "-stream_loop", "-1",
-        "-i", music,
-        "-map", "0:v:0",
-        "-map", "1:a:0",
+        "-stream_loop", "-1", "-i", music,
+        "-map", "0:v:0", "-map", "1:a:0",
         "-shortest",
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-b:a", "192k",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
         output,
     ], capture_output=True, text=True)
     if r.returncode != 0:
-        raise RuntimeError(f"FFmpeg add_music failed:\n{r.stderr}")
+        raise RuntimeError(f"add_music failed:\n{r.stderr[-500:]}")
     return output
 
 
@@ -148,10 +151,10 @@ def handler(job: dict) -> dict:
         print(f"[handler] Presigning {key}")
         return presign_upload(key, content_type)
 
-    video_urls  = inp.get("video_urls", [])
-    music_url   = inp.get("music_url", "")
-    output_key  = inp.get("output_key", f"caotinho/{uuid.uuid4()}.mp4")
-    loop_clips  = inp.get("loop_clips", False)
+    video_urls = inp.get("video_urls", [])
+    music_url  = inp.get("music_url", "")
+    output_key = inp.get("output_key", f"caotinho/{uuid.uuid4()}.mp4")
+    loop_clips = inp.get("loop_clips", False)
 
     if not video_urls:
         return {"error": "video_urls is required"}
@@ -163,41 +166,45 @@ def handler(job: dict) -> dict:
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
 
-        # Download clips
-        video_paths = []
+        # 1. Download clips
+        raw_paths = []
         for i, url in enumerate(video_urls):
             ext = Path(url.split("?")[0]).suffix or ".mp4"
-            dest = str(tmp / f"clip_{i:03d}{ext}")
+            dest = str(tmp / f"raw_{i:03d}{ext}")
             print(f"[handler] Downloading clip {i+1}/{len(video_urls)}")
             download_file(url, dest)
-            video_paths.append(dest)
+            raw_paths.append(dest)
 
-        # Download music
+        # 2. Normalize ALL clips to 1280x720 landscape
+        print("[handler] Normalizing clips to 1280x720 landscape...")
+        norm_paths = []
+        for i, rp in enumerate(raw_paths):
+            np_ = str(tmp / f"norm_{i:03d}.mp4")
+            normalize_to_landscape(rp, np_)
+            norm_paths.append(np_)
+
+        # 3. Download music
         music_ext = Path(music_url.split("?")[0]).suffix or ".mp3"
         music_path = str(tmp / f"music{music_ext}")
         print("[handler] Downloading music")
         download_file(music_url, music_path)
-
-        # Get music duration for loop
-        music_duration = get_video_duration(music_path)
+        music_duration = get_duration(music_path)
         print(f"[handler] Music duration: {music_duration:.1f}s")
 
+        # 4. Concat clips (with loop if needed)
+        video_path = str(tmp / "video.mp4")
         if loop_clips and music_duration > 0:
-            # Loop clips to match music duration
-            video_path = str(tmp / "video.mp4")
             print("[handler] Looping clips to match music duration...")
-            concatenate_videos_loop(video_paths, video_path, music_duration)
+            concatenate_videos_loop(norm_paths, video_path, music_duration)
         else:
-            # Simple concat
-            video_path = str(tmp / "concat.mp4")
-            concatenate_videos(video_paths, video_path)
+            concatenate_videos(norm_paths, video_path)
 
-        # Mix music
+        # 5. Mix music
         final = str(tmp / "final.mp4")
         print("[handler] Adding music...")
         add_music(video_path, music_path, final)
 
-        # Upload
+        # 6. Upload
         print(f"[handler] Uploading: {output_key}")
         public_url = upload_to_r2(final, output_key)
 
