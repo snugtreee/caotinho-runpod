@@ -39,17 +39,69 @@ def upload_to_r2(local_path: str, key: str, content_type="video/mp4") -> str:
 
 
 def presign_upload(key: str, content_type: str, expires: int = 3600) -> dict:
-    """Generate a presigned PUT URL so the browser can upload directly to R2."""
     url = get_s3().generate_presigned_url(
         "put_object",
         Params={"Bucket": R2_BUCKET, "Key": key, "ContentType": content_type},
         ExpiresIn=expires,
         HttpMethod="PUT",
     )
-    return {
-        "upload_url": url,
-        "public_url": f"{R2_PUBLIC_URL}/{key}",
-    }
+    return {"upload_url": url, "public_url": f"{R2_PUBLIC_URL}/{key}"}
+
+
+def get_video_duration(path: str) -> float:
+    """Get video duration in seconds using ffprobe."""
+    r = subprocess.run([
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_format", path
+    ], capture_output=True, text=True)
+    import json
+    try:
+        return float(json.loads(r.stdout)["format"]["duration"])
+    except:
+        return 5.0
+
+
+def concatenate_videos_loop(paths: list, output: str, target_duration: float) -> str:
+    """Concatenate clips in loop until target_duration is reached, then trim."""
+    # Calculate how many loops needed
+    clip_duration = sum(get_video_duration(p) for p in paths)
+    if clip_duration <= 0:
+        clip_duration = len(paths) * 5.0
+    
+    loops_needed = int(target_duration / clip_duration) + 2
+    print(f"[handler] Clips duration: {clip_duration:.1f}s, target: {target_duration:.1f}s, loops: {loops_needed}")
+
+    # Write concat list with loops
+    list_file = output + ".txt"
+    with open(list_file, "w") as f:
+        for _ in range(loops_needed):
+            for p in paths:
+                f.write(f"file '{p}'\n")
+
+    # Concat then trim to target duration
+    looped = output + "_looped.mp4"
+    r = subprocess.run([
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", list_file, "-c", "copy", looped
+    ], capture_output=True, text=True)
+    os.remove(list_file)
+
+    if r.returncode != 0:
+        raise RuntimeError(f"FFmpeg loop concat failed:\n{r.stderr}")
+
+    # Scale to 1280x720 landscape and trim
+    r2 = subprocess.run([
+        "ffmpeg", "-y", "-i", looped,
+        "-t", str(target_duration),
+        "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-an", output
+    ], capture_output=True, text=True)
+    os.remove(looped)
+
+    if r2.returncode != 0:
+        raise RuntimeError(f"FFmpeg scale/trim failed:\n{r2.stderr}")
+    return output
 
 
 def concatenate_videos(paths: list, output: str) -> str:
@@ -57,10 +109,10 @@ def concatenate_videos(paths: list, output: str) -> str:
     with open(list_file, "w") as f:
         for p in paths:
             f.write(f"file '{p}'\n")
-    r = subprocess.run(
-        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file, "-c", "copy", output],
-        capture_output=True, text=True
-    )
+    r = subprocess.run([
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", list_file, "-c", "copy", output
+    ], capture_output=True, text=True)
     os.remove(list_file)
     if r.returncode != 0:
         raise RuntimeError(f"FFmpeg concat failed:\n{r.stderr}")
@@ -90,17 +142,16 @@ def handler(job: dict) -> dict:
     inp = job.get("input", {})
     action = inp.get("action", "")
 
-    # ── presign: gera URL para o browser fazer upload direto ──
     if action == "presign":
-        key          = inp.get("key", f"caotinho/music/{uuid.uuid4()}.mp3")
+        key = inp.get("key", f"caotinho/music/{uuid.uuid4()}.mp3")
         content_type = inp.get("content_type", "audio/mpeg")
-        print(f"[handler] Generating presigned URL for {key}")
+        print(f"[handler] Presigning {key}")
         return presign_upload(key, content_type)
 
-    # ── concat + mix (fluxo principal) ──
-    video_urls = inp.get("video_urls", [])
-    music_url  = inp.get("music_url", "")
-    output_key = inp.get("output_key", f"caotinho/{uuid.uuid4()}.mp4")
+    video_urls  = inp.get("video_urls", [])
+    music_url   = inp.get("music_url", "")
+    output_key  = inp.get("output_key", f"caotinho/{uuid.uuid4()}.mp4")
+    loop_clips  = inp.get("loop_clips", False)
 
     if not video_urls:
         return {"error": "video_urls is required"}
@@ -112,28 +163,42 @@ def handler(job: dict) -> dict:
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
 
+        # Download clips
         video_paths = []
         for i, url in enumerate(video_urls):
-            ext  = Path(url.split("?")[0]).suffix or ".mp4"
+            ext = Path(url.split("?")[0]).suffix or ".mp4"
             dest = str(tmp / f"clip_{i:03d}{ext}")
             print(f"[handler] Downloading clip {i+1}/{len(video_urls)}")
             download_file(url, dest)
             video_paths.append(dest)
 
-        music_ext  = Path(music_url.split("?")[0]).suffix or ".mp3"
+        # Download music
+        music_ext = Path(music_url.split("?")[0]).suffix or ".mp3"
         music_path = str(tmp / f"music{music_ext}")
         print("[handler] Downloading music")
         download_file(music_url, music_path)
 
-        concat = str(tmp / "concat.mp4")
-        print("[handler] Concatenating clips")
-        concatenate_videos(video_paths, concat)
+        # Get music duration for loop
+        music_duration = get_video_duration(music_path)
+        print(f"[handler] Music duration: {music_duration:.1f}s")
 
+        if loop_clips and music_duration > 0:
+            # Loop clips to match music duration
+            video_path = str(tmp / "video.mp4")
+            print("[handler] Looping clips to match music duration...")
+            concatenate_videos_loop(video_paths, video_path, music_duration)
+        else:
+            # Simple concat
+            video_path = str(tmp / "concat.mp4")
+            concatenate_videos(video_paths, video_path)
+
+        # Mix music
         final = str(tmp / "final.mp4")
-        print("[handler] Adding music")
-        add_music(concat, music_path, final)
+        print("[handler] Adding music...")
+        add_music(video_path, music_path, final)
 
-        print(f"[handler] Uploading to R2: {output_key}")
+        # Upload
+        print(f"[handler] Uploading: {output_key}")
         public_url = upload_to_r2(final, output_key)
 
     print(f"[handler] Done → {public_url}")
