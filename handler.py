@@ -63,10 +63,9 @@ def get_duration(path: str) -> float:
 
 
 def get_video_info(path: str) -> dict:
-    """Get video width, height and duration."""
     r = subprocess.run([
         "ffprobe", "-v", "quiet", "-print_format", "json",
-        "-show_streams", "-show_format", path
+        "-show_streams", path
     ], capture_output=True, text=True)
     try:
         data = json.loads(r.stdout)
@@ -75,56 +74,64 @@ def get_video_info(path: str) -> dict:
                 return {
                     "width": int(s.get("width", 0)),
                     "height": int(s.get("height", 0)),
-                    "duration": float(data.get("format", {}).get("duration", 5.0))
                 }
     except:
         pass
-    return {"width": 0, "height": 0, "duration": 5.0}
+    return {"width": 0, "height": 0}
 
 
 def normalize_to_landscape(input_path: str, output_path: str) -> str:
     """
-    Force any video to 1280x720 landscape (16:9).
-    - If portrait (h > w): rotate/crop to fill 16:9
-    - If landscape: scale and pad to exactly 1280x720
+    Convert ANY video to 1920x1080 Full HD landscape, NO black bars.
+    
+    Strategy:
+    - Portrait (h > w): crop width-based 16:9 from center, then scale up
+    - Landscape (w >= h): scale to fill 1920x1080, crop center to remove any excess
+    - Both result in full 1920x1080 with NO black bars
     """
     info = get_video_info(input_path)
     w, h = info["width"], info["height"]
-    print(f"[handler] Input: {w}x{h} → normalizing to {TARGET_W}x{TARGET_H}")
+    print(f"[handler] Input size: {w}x{h}")
 
-    if h > w:
-        # Portrait video — crop center to 16:9 then scale
-        # Crop to the widest 16:9 possible from center
+    if w <= 0 or h <= 0:
+        # fallback - just scale and crop
+        vf = f"scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=increase,crop={TARGET_W}:{TARGET_H}"
+    elif h > w:
+        # PORTRAIT video (e.g. 480x720, 540x960)
+        # Step 1: scale so width = TARGET_W
+        # Step 2: crop height to TARGET_H from center
+        # This fills the frame completely - no black bars
         vf = (
-            f"crop=ih*16/9:ih,"
-            f"scale={TARGET_W}:{TARGET_H}:flags=lanczos"
+            f"scale={TARGET_W}:-2:flags=lanczos,"
+            f"crop={TARGET_W}:{TARGET_H}:0:(ih-{TARGET_H})/2"
         )
     else:
-        # Landscape or square — scale fit with black padding
+        # LANDSCAPE or SQUARE video
+        # Step 1: scale so height = TARGET_H  
+        # Step 2: crop width to TARGET_W from center
         vf = (
-            f"scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=decrease:flags=lanczos,"
-            f"pad={TARGET_W}:{TARGET_H}:(ow-iw)/2:(oh-ih)/2:color=black"
+            f"scale=-2:{TARGET_H}:flags=lanczos,"
+            f"crop={TARGET_W}:{TARGET_H}:(iw-{TARGET_W})/2:0"
         )
 
     r = subprocess.run([
         "ffmpeg", "-y", "-i", input_path,
         "-vf", vf,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
-        "-r", "24",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-r", "24", "-pix_fmt", "yuv420p",
         "-an", output_path
     ], capture_output=True, text=True)
 
     if r.returncode != 0:
+        print(f"[handler] normalize stderr: {r.stderr[-300:]}")
         raise RuntimeError(f"normalize failed:\n{r.stderr[-500:]}")
 
-    # Verify output
     out_info = get_video_info(output_path)
-    print(f"[handler] Output: {out_info['width']}x{out_info['height']}")
+    print(f"[handler] Output size: {out_info['width']}x{out_info['height']} ✓")
     return output_path
 
 
 def concatenate_videos_loop(paths: list, output: str, target_duration: float) -> str:
-    """Loop clips until target_duration is reached."""
     clip_duration = sum(get_duration(p) for p in paths)
     if clip_duration <= 0:
         clip_duration = len(paths) * 5.0
@@ -147,7 +154,6 @@ def concatenate_videos_loop(paths: list, output: str, target_duration: float) ->
     if r.returncode != 0:
         raise RuntimeError(f"loop concat failed:\n{r.stderr[-500:]}")
 
-    # Trim to exact target duration
     r2 = subprocess.run([
         "ffmpeg", "-y", "-i", looped,
         "-t", str(target_duration),
@@ -223,8 +229,8 @@ def handler(job: dict) -> dict:
             download_file(url, dest)
             raw_paths.append(dest)
 
-        # 2. Normalize ALL clips to 1280x720 landscape (CRITICAL)
-        print("[handler] Normalizing all clips to 1280x720 landscape...")
+        # 2. Normalize ALL clips to 1920x1080 Full HD — NO BLACK BARS
+        print("[handler] Normalizing clips to 1920x1080 Full HD...")
         norm_paths = []
         for i, rp in enumerate(raw_paths):
             np_ = str(tmp / f"norm_{i:03d}.mp4")
