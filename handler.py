@@ -14,8 +14,8 @@ R2_SECRET_KEY = os.environ.get("R2_SECRET_KEY", "")
 R2_BUCKET     = os.environ.get("R2_BUCKET", "caotinho")
 R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "")
 
-TARGET_W = 1280
-TARGET_H = 720
+TARGET_W = 1920
+TARGET_H = 1080
 
 
 def get_s3():
@@ -62,22 +62,69 @@ def get_duration(path: str) -> float:
         return 5.0
 
 
+def get_video_info(path: str) -> dict:
+    """Get video width, height and duration."""
+    r = subprocess.run([
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_streams", "-show_format", path
+    ], capture_output=True, text=True)
+    try:
+        data = json.loads(r.stdout)
+        for s in data.get("streams", []):
+            if s.get("codec_type") == "video":
+                return {
+                    "width": int(s.get("width", 0)),
+                    "height": int(s.get("height", 0)),
+                    "duration": float(data.get("format", {}).get("duration", 5.0))
+                }
+    except:
+        pass
+    return {"width": 0, "height": 0, "duration": 5.0}
+
+
 def normalize_to_landscape(input_path: str, output_path: str) -> str:
-    """Scale and pad any video to 1280x720 landscape."""
+    """
+    Force any video to 1280x720 landscape (16:9).
+    - If portrait (h > w): rotate/crop to fill 16:9
+    - If landscape: scale and pad to exactly 1280x720
+    """
+    info = get_video_info(input_path)
+    w, h = info["width"], info["height"]
+    print(f"[handler] Input: {w}x{h} → normalizing to {TARGET_W}x{TARGET_H}")
+
+    if h > w:
+        # Portrait video — crop center to 16:9 then scale
+        # Crop to the widest 16:9 possible from center
+        vf = (
+            f"crop=ih*16/9:ih,"
+            f"scale={TARGET_W}:{TARGET_H}:flags=lanczos"
+        )
+    else:
+        # Landscape or square — scale fit with black padding
+        vf = (
+            f"scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=decrease:flags=lanczos,"
+            f"pad={TARGET_W}:{TARGET_H}:(ow-iw)/2:(oh-ih)/2:color=black"
+        )
+
     r = subprocess.run([
         "ffmpeg", "-y", "-i", input_path,
-        "-vf", f"scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=decrease,"
-               f"pad={TARGET_W}:{TARGET_H}:(ow-iw)/2:(oh-ih)/2:color=black",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+        "-vf", vf,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+        "-r", "24",
         "-an", output_path
     ], capture_output=True, text=True)
+
     if r.returncode != 0:
         raise RuntimeError(f"normalize failed:\n{r.stderr[-500:]}")
+
+    # Verify output
+    out_info = get_video_info(output_path)
+    print(f"[handler] Output: {out_info['width']}x{out_info['height']}")
     return output_path
 
 
 def concatenate_videos_loop(paths: list, output: str, target_duration: float) -> str:
-    """Loop clips until target_duration, all normalized to 1280x720."""
+    """Loop clips until target_duration is reached."""
     clip_duration = sum(get_duration(p) for p in paths)
     if clip_duration <= 0:
         clip_duration = len(paths) * 5.0
@@ -100,9 +147,10 @@ def concatenate_videos_loop(paths: list, output: str, target_duration: float) ->
     if r.returncode != 0:
         raise RuntimeError(f"loop concat failed:\n{r.stderr[-500:]}")
 
-    # Trim to target duration
+    # Trim to exact target duration
     r2 = subprocess.run([
-        "ffmpeg", "-y", "-i", looped, "-t", str(target_duration),
+        "ffmpeg", "-y", "-i", looped,
+        "-t", str(target_duration),
         "-c", "copy", "-an", output
     ], capture_output=True, text=True)
     os.remove(looped)
@@ -175,8 +223,8 @@ def handler(job: dict) -> dict:
             download_file(url, dest)
             raw_paths.append(dest)
 
-        # 2. Normalize ALL clips to 1280x720 landscape
-        print("[handler] Normalizing clips to 1280x720 landscape...")
+        # 2. Normalize ALL clips to 1280x720 landscape (CRITICAL)
+        print("[handler] Normalizing all clips to 1280x720 landscape...")
         norm_paths = []
         for i, rp in enumerate(raw_paths):
             np_ = str(tmp / f"norm_{i:03d}.mp4")
@@ -191,10 +239,10 @@ def handler(job: dict) -> dict:
         music_duration = get_duration(music_path)
         print(f"[handler] Music duration: {music_duration:.1f}s")
 
-        # 4. Concat clips (with loop if needed)
+        # 4. Concat with loop
         video_path = str(tmp / "video.mp4")
-        if loop_clips and music_duration > 0:
-            print("[handler] Looping clips to match music duration...")
+        if loop_clips and music_duration > 10:
+            print("[handler] Looping clips to fill music duration...")
             concatenate_videos_loop(norm_paths, video_path, music_duration)
         else:
             concatenate_videos(norm_paths, video_path)
